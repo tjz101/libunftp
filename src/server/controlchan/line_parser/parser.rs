@@ -114,7 +114,7 @@ where
             }
             // TODO:: Can we do this without allocation?
             // let path = String::from_utf8_lossy(&path);
-            let path = to_string_lossy(&path, client_charset);
+            let path = to_string_lossy(&path, client_charset)?;
             Command::Stor { path: path.to_string() }
         }
         "LIST" => {
@@ -422,9 +422,12 @@ fn normalize(token: &[u8]) -> Result<String> {
     Ok(str::from_utf8(token).map(|t| t.to_uppercase())?)
 }
 
-fn to_string_lossy(v: &[u8], client_charset: &str) -> String {
+fn to_string_lossy(v: &[u8], client_charset: &str) -> Result<String> {
     if "GBK" == client_charset.to_uppercase() {
-        return GBK.decode(&v, DecoderTrap::Strict).unwrap()
+        return match GBK.decode(&v, DecoderTrap::Strict) {
+            Ok(s) => Ok(s),
+            _ => Err(ParseErrorKind::InvalidGbk.into()),
+        }
     }
-    String::from_utf8_lossy(&v).to_string()
+    Ok(String::from_utf8_lossy(&v).to_string())
 }

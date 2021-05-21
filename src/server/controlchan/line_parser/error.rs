@@ -23,6 +23,8 @@ pub enum ParseErrorKind {
     /// Non-UTF8 character encountered.
     #[display(fmt = "Non-UTF8 character while parsing")]
     InvalidUtf8,
+    #[display(fmt = "Non-GBK character while parsing")]
+    InvalidGbk,
     /// Invalid end-of-line character.
     #[display(fmt = "Invalid end-of-line")]
     InvalidEol,
