@@ -21,7 +21,7 @@ use crate::{
 use crate::options::{FtpsClientAuth, TlsFlags};
 use crate::server::tls;
 use futures::{channel::mpsc::channel, SinkExt};
-use options::{PassiveHost, DEFAULT_GREETING, DEFAULT_IDLE_SESSION_TIMEOUT_SECS};
+use options::{PassiveHost, DEFAULT_GREETING, DEFAULT_IDLE_SESSION_TIMEOUT_SECS, DEFAULT_CLIENT_CHARSET};
 use slog::*;
 use std::{fmt::Debug, net::IpAddr, ops::Range, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
@@ -71,6 +71,7 @@ where
     proxy_protocol_switchboard: Option<ProxyProtocolSwitchboard<Storage, User>>,
     logger: slog::Logger,
     sitemd5: SiteMd5,
+    client_charset: &'static str,
 }
 
 impl<Storage, User> Debug for Server<Storage, User>
@@ -96,6 +97,7 @@ where
             .field("idle_session_timeout", &self.idle_session_timeout)
             .field("proxy_protocol_mode", &self.proxy_protocol_mode)
             .field("proxy_protocol_switchboard", &self.proxy_protocol_switchboard)
+            .field("client_charset", &self.client_charset)
             .finish()
     }
 }
@@ -142,6 +144,7 @@ where
             ftps_client_auth: FtpsClientAuth::default(),
             ftps_trust_store: options::DEFAULT_FTPS_TRUST_STORE.into(),
             sitemd5: SiteMd5::default(),
+            client_charset: DEFAULT_CLIENT_CHARSET
         }
     }
 
@@ -280,6 +283,26 @@ where
     /// ```
     pub fn greeting(mut self, greeting: &'static str) -> Self {
         self.greeting = greeting;
+        self
+    }
+
+    // Set client charset
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libunftp::Server;
+    /// use unftp_sbe_fs::ServerExt;
+    ///
+    /// // Use it in a builder-like pattern:
+    /// let mut server = Server::with_fs("/tmp").greeting("GBK");
+    ///
+    /// // Or instead if you prefer:
+    /// let mut server = Server::with_fs("/tmp");
+    /// server.client_charset("GBK");
+    /// ```
+    pub fn client_charset(mut self, client_charset: &'static str) -> Self {
+        self.client_charset = client_charset;
         self
     }
 
@@ -475,7 +498,7 @@ where
                 Ok((tcp_stream, socket_addr)) => {
                     slog::info!(self.logger, "Incoming control connection from {:?}", socket_addr);
                     let params: controlchan::LoopConfig<Storage, User> = (&self).into();
-                    let result = controlchan::spawn_loop::<Storage, User>(params, tcp_stream, None, None).await;
+                    let result = controlchan::spawn_loop::<Storage, User>(params, tcp_stream, None, None, self.client_charset).await;
                     if let Err(err) = result {
                         slog::error!(
                             self.logger,
@@ -533,7 +556,7 @@ where
                         let source = connection.source;
                         slog::info!(self.logger, "Connection from {:?} is a control connection", source);
                         let params: controlchan::LoopConfig<Storage,User> = (&self).into();
-                        let result = controlchan::spawn_loop::<Storage,User>(params, tcp_stream, Some(source), Some(proxyloop_msg_tx.clone())).await;
+                        let result = controlchan::spawn_loop::<Storage,User>(params, tcp_stream, Some(source), Some(proxyloop_msg_tx.clone()), self.client_charset).await;
                         if result.is_err() {
                             slog::warn!(self.logger, "Could not spawn control channel loop for connection: {:?}", result.err().unwrap())
                         }

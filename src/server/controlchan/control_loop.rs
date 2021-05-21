@@ -67,6 +67,7 @@ pub async fn spawn<Storage, User>(
     tcp_stream: TcpStream,
     destination: Option<SocketAddr>,
     proxyloop_msg_tx: Option<ProxyLoopSender<Storage, User>>,
+    client_charset: &'static str,
 ) -> Result<(), ControlChanError>
 where
     User: UserDetail + 'static,
@@ -144,7 +145,7 @@ where
         next: event_chain,
     };
 
-    let codec = FtpCodec::new();
+    let codec = FtpCodec::new(client_charset);
     let cmd_and_reply_stream: Framed<Box<dyn AsyncReadAsyncWriteSendUnpin>, FtpCodec> = codec.framed(Box::new(tcp_stream));
     let (mut reply_sink, command_source) = cmd_and_reply_stream.split();
 
@@ -208,7 +209,7 @@ where
                         };
 
                         // Wrap in codec again and get sink + source
-                        let codec = FtpCodec::new();
+                        let codec = FtpCodec::new(client_charset);
                         let cmd_and_reply_stream = codec.framed(io);
                         let (sink, src) = cmd_and_reply_stream.split();
                         let src = src.fuse();

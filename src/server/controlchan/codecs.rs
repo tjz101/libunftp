@@ -12,11 +12,12 @@ pub struct FtpCodec {
     // is the next index to examine. The next time `decode` is called with `abcde\n`, we will only
     // look at `de\n` before returning.
     next_index: usize,
+    client_charset: &'static str
 }
 
 impl FtpCodec {
-    pub fn new() -> Self {
-        FtpCodec { next_index: 0 }
+    pub fn new(client_charset: &'static str) -> Self {
+        FtpCodec { next_index: 0, client_charset: client_charset }
     }
 }
 
@@ -31,7 +32,7 @@ impl Decoder for FtpCodec {
             let newline_index = newline_offset + self.next_index;
             let line = buf.split_to(newline_index + 1);
             self.next_index = 0;
-            Ok(Some(line_parser::parse(line)?))
+            Ok(Some(line_parser::parse(line, self.client_charset)?))
         } else {
             self.next_index = buf.len();
             Ok(None)

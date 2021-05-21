@@ -16,6 +16,7 @@ pub(crate) const DEFAULT_PASSIVE_HOST: PassiveHost = PassiveHost::FromConnection
 pub(crate) const DEFAULT_PASSIVE_PORTS: Range<u16> = 49152..65535;
 pub(crate) const DEFAULT_FTPS_REQUIRE: FtpsRequired = FtpsRequired::None;
 pub(crate) const DEFAULT_FTPS_TRUST_STORE: &str = "./trusted.pem";
+pub(crate) const DEFAULT_CLIENT_CHARSET: &str = "UTF-8";
 
 /// The option to `Server.passive_host`. It allows the user to specify how the IP address
 /// communicated in the _PASV_ response is determined.
