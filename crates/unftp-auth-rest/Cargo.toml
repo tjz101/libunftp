@@ -1,6 +1,6 @@
 [package]
 name = "unftp-auth-rest"
-version = "0.1.0"
+version = "0.2.0"
 description = "An authenticator back-end for libunftp that consumes an HTTP API to authenticate"
 authors = [
     "Agoston Horvath <ahorvath@bol.com>",
@@ -8,7 +8,7 @@ authors = [
     "Hannes de Jager <hdejager@bol.com>",
     "Rob klein Gunnewiek <rkleingunnewiek@bol.com>",
 ]
-edition = "2018"
+edition = "2021"
 license = "Apache-2.0"
 keywords = ["libunftp", "ftp", "ftps", "auth", "rest"]
 categories = ["network-programming"]
@@ -18,19 +18,20 @@ repository = "https://github.com/bolcom/libunftp/tree/hannes/crates/unftp-auth-r
 readme = "README.md"
 
 [dependencies]
-async-trait = "0.1.50"
-hyper = { version = "0.14.7", features= ["client", "runtime", "stream", "http1"]}
-hyper-rustls = { version = "0.22.1"}
-libunftp = { version="0.17.3", path="../../"}
-unftp-sbe-fs = { version="0.1", path="../unftp-sbe-fs"}
+async-trait = "0.1.52"
+hyper = { version = "0.14.16", features= ["client", "runtime", "stream", "http1"]}
+hyper-rustls = { version = "0.23.0"}
+libunftp = { version="0.18.2", path="../../"}
 percent-encoding = { version = "2.1.0"}
-regex = "1.4.6"
-serde = { version = "1.0.125", features = ["derive"] }
-serde_json = { version = "1.0.64"}
-tokio = { version = "1.5.0", features = ["rt", "net", "sync", "io-util", "macros", "time", "fs"]}
-tracing = "0.1.25"
-tracing-attributes = "0.1.15"
+regex = "1.5.4"
+serde = { version = "1.0.133", features = ["derive"] }
+serde_json = { version = "1.0.74"}
+tokio = { version = "1.15.0", features = ["rt", "net", "sync", "io-util", "time"] }
+tracing = { version = "0.1.29", default-features = false }
+tracing-attributes = "0.1.16"
 
 
 [dev-dependencies]
 pretty_env_logger = "0.4.0"
+tokio = { version = "1.13.0", features = ["macros"] }
+unftp-sbe-fs = { version="0.2", path="../unftp-sbe-fs"}

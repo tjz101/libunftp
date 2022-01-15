@@ -5,14 +5,66 @@
 
 //! An storage back-end for [libunftp](https://github.com/bolcom/libunftp) that let you store files
 //! in [Google Cloud Storage](https://cloud.google.com/storage).
+//!
+//! # Usage
+//!
+//! Add the needed dependencies to Cargo.toml:
+//!
+//! ```toml
+//! [dependencies]
+//! libunftp = "0.18.2"
+//! unftp-sbe-gcs = "0.2.0"
+//! tokio = { version = "1", features = ["full"] }
+//! ```
+//!
+//! And add to src/main.rs:
+//!
+//! ```no_run
+//! use libunftp::Server;
+//! use unftp_sbe_gcs::{ServerExt, options::AuthMethod};
+//! use std::path::PathBuf;
+//!
+//! #[tokio::main]
+//! pub async fn main() {
+//!     let server = Server::with_gcs("my-bucket", PathBuf::from("/unftp"), AuthMethod::WorkloadIdentity(None))
+//!       .greeting("Welcome to my FTP server")
+//!       .passive_ports(50000..65535);
+//!
+//!     server.listen("127.0.0.1:2121").await;
+//! }
+//! ```
+//!
+//! This example uses the `ServerExt` extension trait. You can also call one of the other
+//! constructors of `Server` e.g.
+//!
+//! ```no_run
+//! use libunftp::Server;
+//! use unftp_sbe_gcs::{CloudStorage, options::AuthMethod};
+//! use std::path::PathBuf;
+//!
+//! #[tokio::main]
+//! pub async fn main() {
+//!     let server = libunftp::Server::new(
+//!         Box::new(move || CloudStorage::with_bucket_root("my-bucket", PathBuf::from("/ftp-root"), AuthMethod::WorkloadIdentity(None)))
+//!       )
+//!       .greeting("Welcome to my FTP server")
+//!       .passive_ports(50000..65535);
+//!
+//!     server.listen("127.0.0.1:2121").await;
+//! }
+//! ```
+//!
 
 // FIXME: error mapping from GCS/hyper is minimalistic, mostly PermanentError. Do proper mapping and better reporting (temporary failures too!)
 
+mod ext;
 pub mod object_metadata;
 pub mod options;
 mod response_body;
 mod uri;
 mod workflow_identity;
+
+pub use ext::ServerExt;
 
 use async_trait::async_trait;
 use bytes::Buf;
@@ -24,7 +76,8 @@ use hyper::{
     http::{header, Method, StatusCode, Uri},
     Body, Client, Request, Response,
 };
-use hyper_rustls::HttpsConnector;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use libunftp::auth::UserDetail;
 use libunftp::storage::{Error, ErrorKind, Fileinfo, Metadata, StorageBackend};
 use mime::APPLICATION_OCTET_STREAM;
 use object_metadata::ObjectMetadata;
@@ -40,10 +93,11 @@ use uri::GcsUri;
 use yup_oauth2::ServiceAccountAuthenticator;
 
 /// A [`StorageBackend`](libunftp::storage::StorageBackend) that uses Cloud storage from Google.
+/// cloned for each controlchan!
 #[derive(Clone, Debug)]
 pub struct CloudStorage {
     uris: GcsUri,
-    client: Client<HttpsConnector<HttpConnector>>, //TODO: maybe it should be an Arc<> or a 'static
+    client: Client<HttpsConnector<HttpConnector>>,
     auth: AuthMethod,
 }
 
@@ -78,7 +132,8 @@ impl CloudStorage {
         Str: Into<String>,
         AuthHow: Into<AuthMethod>,
     {
-        let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> = Client::builder().build(HttpsConnector::with_native_roots());
+        let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> =
+            Client::builder().build(HttpsConnectorBuilder::new().with_native_roots().https_or_http().enable_http1().build());
         CloudStorage {
             client,
             auth: auth.into(),
@@ -86,13 +141,11 @@ impl CloudStorage {
         }
     }
 
+    // TODO: Cache the token. For `ServiceAccountKey`, the oauth client would already cache the token - we just need to move it to `CloudStorage`. For `WorkloadIdentity`, we can cache it in `CloudStorage`.
     #[tracing_attributes::instrument]
     async fn get_token(&self) -> Result<String, Error> {
         match &self.auth {
-            AuthMethod::ServiceAccountKey(k) => {
-                if b"unftp_test" == k.as_slice() {
-                    return Ok("test".to_string());
-                }
+            AuthMethod::ServiceAccountKey(_) => {
                 let key = self.auth.to_service_account_key()?;
                 let auth = ServiceAccountAuthenticator::builder(key).hyper_client(self.client.clone()).build().await?;
 
@@ -104,12 +157,13 @@ impl CloudStorage {
             AuthMethod::WorkloadIdentity(service) => workflow_identity::request_token(service.clone(), self.client.clone())
                 .await
                 .map(|t| t.access_token),
+            AuthMethod::None => Ok("unftp_test".to_string()),
         }
     }
 }
 
 #[async_trait]
-impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
+impl<User: UserDetail> StorageBackend<User> for CloudStorage {
     type Metadata = ObjectMetadata;
 
     fn supported_features(&self) -> u32 {
@@ -117,7 +171,7 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
     }
 
     #[tracing_attributes::instrument]
-    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, path: P) -> Result<Self::Metadata, Error> {
+    async fn metadata<P: AsRef<Path> + Send + Debug>(&self, _user: &User, path: P) -> Result<Self::Metadata, Error> {
         let uri: Uri = self.uris.metadata(path)?;
 
         let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> = self.client.clone();
@@ -141,10 +195,37 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
         response.to_metadata()
     }
 
-    #[tracing_attributes::instrument]
-    async fn list<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, path: P) -> Result<Vec<Fileinfo<PathBuf, Self::Metadata>>, Error>
+    async fn md5<P: AsRef<Path> + Send + Debug>(&self, _user: &User, path: P) -> Result<String, Error>
     where
-        <Self as StorageBackend<U>>::Metadata: Metadata,
+        P: AsRef<Path> + Send + Debug,
+    {
+        let uri: Uri = self.uris.metadata(path)?;
+
+        let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> = self.client.clone();
+
+        let token = self.get_token().await?;
+        let request: Request<Body> = Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .method(Method::GET)
+            .body(Body::empty())
+            .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e))?;
+
+        let response: Response<Body> = client.request(request).map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e)).await?;
+
+        let body = unpack_response(response).await?;
+
+        let body_str: &str = std::str::from_utf8(body.chunk()).map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e))?;
+
+        let response: Item = serde_json::from_str(body_str).map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e))?;
+
+        Ok(response.to_md5()?)
+    }
+
+    #[tracing_attributes::instrument]
+    async fn list<P: AsRef<Path> + Send + Debug>(&self, _user: &User, path: P) -> Result<Vec<Fileinfo<PathBuf, Self::Metadata>>, Error>
+    where
+        <Self as StorageBackend<User>>::Metadata: Metadata,
     {
         let uri: Uri = self.uris.list(path)?;
 
@@ -165,7 +246,7 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
     }
 
     // #[tracing_attributes::instrument]
-    async fn get_into<'a, P, W: ?Sized>(&self, user: &Option<U>, path: P, start_pos: u64, output: &'a mut W) -> Result<u64, Error>
+    async fn get_into<'a, P, W: ?Sized>(&self, user: &User, path: P, start_pos: u64, output: &'a mut W) -> Result<u64, Error>
     where
         W: tokio::io::AsyncWrite + Unpin + Sync + Send,
         P: AsRef<Path> + Send + Debug,
@@ -181,7 +262,7 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
     //#[tracing_attributes::instrument]
     async fn get<P: AsRef<Path> + Send + Debug>(
         &self,
-        _user: &Option<U>,
+        _user: &User,
         path: P,
         _start_pos: u64,
     ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>, Error> {
@@ -210,7 +291,7 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
 
     async fn put<P: AsRef<Path> + Send + Debug, B: tokio::io::AsyncRead + Send + Sync + Unpin + 'static>(
         &self,
-        _user: &Option<U>,
+        _user: &User,
         bytes: B,
         path: P,
         _start_pos: u64,
@@ -238,7 +319,7 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
     }
 
     #[tracing_attributes::instrument]
-    async fn del<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, path: P) -> Result<(), Error> {
+    async fn del<P: AsRef<Path> + Send + Debug>(&self, _user: &User, path: P) -> Result<(), Error> {
         let uri: Uri = self.uris.delete(path)?;
 
         let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> = self.client.clone();
@@ -256,7 +337,7 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
     }
 
     #[tracing_attributes::instrument]
-    async fn mkd<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, path: P) -> Result<(), Error> {
+    async fn mkd<P: AsRef<Path> + Send + Debug>(&self, _user: &User, path: P) -> Result<(), Error> {
         let uri: Uri = self.uris.mkd(path)?;
         let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> = self.client.clone();
 
@@ -275,48 +356,21 @@ impl<U: Sync + Send + Debug> StorageBackend<U> for CloudStorage {
     }
 
     #[tracing_attributes::instrument]
-    async fn rename<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, _from: P, _to: P) -> Result<(), Error> {
+    async fn rename<P: AsRef<Path> + Send + Debug>(&self, _user: &User, _from: P, _to: P) -> Result<(), Error> {
         // TODO: implement this
         Err(Error::from(ErrorKind::CommandNotImplemented))
     }
 
     #[tracing_attributes::instrument]
-    async fn rmd<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, _path: P) -> Result<(), Error> {
+    async fn rmd<P: AsRef<Path> + Send + Debug>(&self, _user: &User, _path: P) -> Result<(), Error> {
         // TODO: implement this
         Err(Error::from(ErrorKind::CommandNotImplemented))
     }
 
     #[tracing_attributes::instrument]
-    async fn cwd<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, _path: P) -> Result<(), Error> {
+    async fn cwd<P: AsRef<Path> + Send + Debug>(&self, _user: &User, _path: P) -> Result<(), Error> {
         // TODO: Do we want to check here if the path is a directory?
         Ok(())
-    }
-
-    async fn md5<P: AsRef<Path> + Send + Debug>(&self, _user: &Option<U>, path: P) -> Result<String, Error>
-    where
-        P: AsRef<Path> + Send + Debug,
-    {
-        let uri: Uri = self.uris.metadata(path)?;
-
-        let client: Client<HttpsConnector<HttpConnector<GaiResolver>>, Body> = self.client.clone();
-
-        let token = self.get_token().await?;
-        let request: Request<Body> = Request::builder()
-            .uri(uri)
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
-            .method(Method::GET)
-            .body(Body::empty())
-            .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e))?;
-
-        let response: Response<Body> = client.request(request).map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e)).await?;
-
-        let body = unpack_response(response).await?;
-
-        let body_str: &str = std::str::from_utf8(body.chunk()).map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e))?;
-
-        let response: Item = serde_json::from_str(body_str).map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e))?;
-
-        Ok(response.to_md5()?)
     }
 }
 

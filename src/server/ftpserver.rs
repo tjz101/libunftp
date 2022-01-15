@@ -1,31 +1,29 @@
+mod chosen;
 pub mod error;
+mod listen;
+mod listen_proxied;
 pub mod options;
 
 use super::{
-    chancomms::{ControlChanMsg, ProxyLoopMsg, ProxyLoopReceiver, ProxyLoopSender},
     controlchan,
-    datachan::spawn_processing,
-    ftpserver::{error::ServerError, options::FtpsRequired, options::SiteMd5},
+    ftpserver::{error::ServerError, error::ShutdownError, options::FtpsRequired, options::SiteMd5},
+    shutdown,
     tls::FtpsConfig,
 };
 use crate::{
     auth::{anonymous::AnonymousAuthenticator, Authenticator, UserDetail},
+    notification::{nop::NopListener, DataListener, PresenceListener},
+    options::{FtpsClientAuth, TlsFlags},
+    server::shutdown::Notifier,
     server::{
-        proxy_protocol::{get_peer_from_proxy_header, ConnectionTuple, ProxyMode, ProxyProtocolSwitchboard},
-        session::SharedSession,
-        Reply,
+        proxy_protocol::{ProxyMode, ProxyProtocolSwitchboard},
+        tls,
     },
     storage::{Metadata, StorageBackend},
 };
-
-use crate::options::{FtpsClientAuth, TlsFlags};
-use crate::server::tls;
-use futures::{channel::mpsc::channel, SinkExt};
 use options::{PassiveHost, DEFAULT_GREETING, DEFAULT_IDLE_SESSION_TIMEOUT_SECS, DEFAULT_CLIENT_CHARSET};
 use slog::*;
-use std::{fmt::Debug, net::IpAddr, ops::Range, path::PathBuf, sync::Arc, time::Duration};
-use tokio::io::AsyncWriteExt;
-use tokio_stream::StreamExt;
+use std::{fmt::Debug, future::Future, net::SocketAddr, ops::Range, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 /// An instance of an FTP(S) server. It aggregates an [`Authenticator`](crate::auth::Authenticator)
 /// implementation that will be used for authentication, and a [`StorageBackend`](crate::storage::StorageBackend)
@@ -54,9 +52,11 @@ where
     Storage: StorageBackend<User>,
     User: UserDetail,
 {
-    storage: Box<dyn (Fn() -> Storage) + Send + Sync>,
+    storage: Arc<dyn (Fn() -> Storage) + Send + Sync>,
     greeting: &'static str,
     authenticator: Arc<dyn Authenticator<User>>,
+    data_listener: Arc<dyn DataListener>,
+    presence_listener: Arc<dyn PresenceListener>,
     passive_ports: Range<u16>,
     passive_host: PassiveHost,
     collect_metrics: bool,
@@ -68,38 +68,10 @@ where
     ftps_trust_store: PathBuf,
     idle_session_timeout: std::time::Duration,
     proxy_protocol_mode: ProxyMode,
-    proxy_protocol_switchboard: Option<ProxyProtocolSwitchboard<Storage, User>>,
     logger: slog::Logger,
-    sitemd5: SiteMd5,
+    site_md5: SiteMd5,
     client_charset: &'static str,
-}
-
-impl<Storage, User> Debug for Server<Storage, User>
-where
-    Storage: StorageBackend<User>,
-    User: UserDetail,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Server")
-            .field("authenticator", &self.authenticator)
-            .field("collect_metrics", &self.collect_metrics)
-            .field("greeting", &self.greeting)
-            .field("logger", &self.logger)
-            .field("metrics", &self.collect_metrics)
-            .field("passive_ports", &self.passive_ports)
-            .field("passive_host", &self.passive_host)
-            .field("ftps_client_auth", &self.ftps_client_auth)
-            .field("ftps_mode", &self.ftps_mode)
-            .field("ftps_required_control_chan", &self.ftps_required_control_chan)
-            .field("ftps_required_data_chan", &self.ftps_required_data_chan)
-            .field("ftps_tls_flags", &self.ftps_tls_flags)
-            .field("ftps_trust_store", &self.ftps_trust_store)
-            .field("idle_session_timeout", &self.idle_session_timeout)
-            .field("proxy_protocol_mode", &self.proxy_protocol_mode)
-            .field("proxy_protocol_switchboard", &self.proxy_protocol_switchboard)
-            .field("client_charset", &self.client_charset)
-            .finish()
-    }
+    shutdown: Pin<Box<dyn Future<Output = options::Shutdown> + Send + Sync>>,
 }
 
 impl<Storage, User> Server<Storage, User>
@@ -120,31 +92,33 @@ where
         Self::with_authenticator(sbe_generator, Arc::new(AnonymousAuthenticator {}))
     }
 
-    /// Construct a new [`Server`] with the given [`StorageBackend`] and [`Authenticator`]. The other parameters will be set to defaults.
+    /// Construct a new [`Server`] with the given [`StorageBackend`] generator and [`Authenticator`]. The other parameters will be set to defaults.
     ///
     /// [`Server`]: struct.Server.html
     /// [`StorageBackend`]: ../storage/trait.StorageBackend.html
     /// [`Authenticator`]: ../auth/trait.Authenticator.html
-    pub fn with_authenticator(s: Box<dyn (Fn() -> Storage) + Send + Sync>, authenticator: Arc<dyn Authenticator<User> + Send + Sync>) -> Self {
+    pub fn with_authenticator(sbe_generator: Box<dyn (Fn() -> Storage) + Send + Sync>, authenticator: Arc<dyn Authenticator<User> + Send + Sync>) -> Self {
         Server {
-            storage: s,
+            storage: Arc::from(sbe_generator),
             greeting: DEFAULT_GREETING,
             authenticator,
+            data_listener: Arc::new(NopListener {}),
+            presence_listener: Arc::new(NopListener {}),
             passive_ports: options::DEFAULT_PASSIVE_PORTS,
             passive_host: options::DEFAULT_PASSIVE_HOST,
             ftps_mode: FtpsConfig::Off,
             collect_metrics: false,
             idle_session_timeout: Duration::from_secs(DEFAULT_IDLE_SESSION_TIMEOUT_SECS),
             proxy_protocol_mode: ProxyMode::Off,
-            proxy_protocol_switchboard: Option::None,
             logger: slog::Logger::root(slog_stdlog::StdLog {}.fuse(), slog::o!()),
             ftps_required_control_chan: options::DEFAULT_FTPS_REQUIRE,
             ftps_required_data_chan: options::DEFAULT_FTPS_REQUIRE,
             ftps_tls_flags: TlsFlags::default(),
             ftps_client_auth: FtpsClientAuth::default(),
             ftps_trust_store: options::DEFAULT_FTPS_TRUST_STORE.into(),
-            sitemd5: SiteMd5::default(),
-            client_charset: DEFAULT_CLIENT_CHARSET
+            site_md5: SiteMd5::default(),
+            client_charset: DEFAULT_CLIENT_CHARSET,
+            shutdown: Box::pin(futures_util::future::pending()),
         }
     }
 
@@ -352,6 +326,20 @@ where
         self
     }
 
+    /// Sets an [`DataListener`](crate::notification::DataListener) that will
+    /// be notified of data changes that happen in a user's session.
+    pub fn notify_data(mut self, listener: impl DataListener + 'static) -> Self {
+        self.data_listener = Arc::new(listener);
+        self
+    }
+
+    /// Sets an [`PresenceListener`](crate::notification::PresenceListener) that will
+    /// be notified of user logins and logouts
+    pub fn notify_presence(mut self, listener: impl PresenceListener + 'static) -> Self {
+        self.presence_listener = Arc::new(listener);
+        self
+    }
+
     /// Specifies how the IP address that libunftp will advertise in response to the PASV command is
     /// determined.
     ///
@@ -450,11 +438,58 @@ where
     /// ```
     pub fn proxy_protocol_mode(mut self, external_control_port: u16) -> Self {
         self.proxy_protocol_mode = external_control_port.into();
-        self.proxy_protocol_switchboard = Some(ProxyProtocolSwitchboard::new(self.logger.clone(), self.passive_ports.clone()));
         self
     }
 
-    /// Runs the main ftp process asynchronously. Should be started in a async runtime context.
+    /// Allows telling libunftp when and how to shutdown gracefully.
+    ///
+    /// The passed argument is a future that resolves when libunftp should shut down. The future
+    /// should return a [options::Shutdown](options::Shutdown) instance.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use libunftp::Server;
+    /// use unftp_sbe_fs::ServerExt;
+    ///
+    /// let mut server = Server::with_fs("/tmp").shutdown_indicator(async {
+    ///    tokio::time::sleep(Duration::from_secs(10)).await; // Shut the server down after 10 seconds.
+    ///    libunftp::options::Shutdown::new()
+    ///      .grace_period(Duration::from_secs(5)) // Allow 5 seconds to shutdown gracefully
+    /// });
+    /// ```
+    pub fn shutdown_indicator<I>(mut self, indicator: I) -> Self
+    where
+        I: Future<Output = options::Shutdown> + Send + Sync + 'static,
+    {
+        self.shutdown = Box::pin(indicator);
+        self
+    }
+
+    /// Enables the FTP command 'SITE MD5'.
+    ///
+    /// _Warning:_ Depending on the storage backend, SITE MD5 may use relatively much memory and
+    /// generate high CPU usage. This opens a Denial of Service vulnerability that could be exploited
+    /// by malicious users, by means of flooding the server with SITE MD5 commands. As such this
+    /// feature is probably best user configured and at least disabled for anonymous users by default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use libunftp::Server;
+    /// use libunftp::options::SiteMd5;
+    /// use unftp_sbe_fs::ServerExt;
+    ///
+    /// // Use it in a builder-like pattern:
+    /// let mut server = Server::with_fs("/tmp").sitemd5(SiteMd5::None);
+    /// ```
+    pub fn sitemd5<M: Into<SiteMd5>>(mut self, sitemd5_option: M) -> Self {
+        self.site_md5 = sitemd5_option.into();
+        self
+    }
+
+    /// Runs the main FTP process asynchronously. Should be started in a async runtime context.
     ///
     /// # Example
     ///
@@ -470,10 +505,6 @@ where
     /// drop(rt);
     /// ```
     ///
-    /// # Panics
-    ///
-    /// This function panics when called with invalid addresses or when the process is unable to
-    /// `bind()` to the address.
     #[tracing_attributes::instrument]
     pub async fn listen<T: Into<String> + Debug>(mut self, bind_address: T) -> std::result::Result<(), ServerError> {
         self.ftps_mode = match self.ftps_mode {
@@ -483,191 +514,72 @@ where
             },
             FtpsConfig::On { tls_config } => FtpsConfig::On { tls_config },
         };
-        match self.proxy_protocol_mode {
-            ProxyMode::On { external_control_port } => self.listen_proxy_protocol_mode(bind_address, external_control_port).await,
-            ProxyMode::Off => self.listen_normal_mode(bind_address).await,
-        }
-    }
+        let logger = self.logger.clone();
+        let bind_address: SocketAddr = bind_address.into().parse()?;
+        let client_charset = self.client_charset;
+        let shutdown_notifier = Arc::new(shutdown::Notifier::new());
 
-    #[tracing_attributes::instrument]
-    async fn listen_normal_mode<T: Into<String> + Debug>(self, bind_address: T) -> std::result::Result<(), ServerError> {
-        let addr: std::net::SocketAddr = bind_address.into().parse()?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        loop {
-            match listener.accept().await {
-                Ok((tcp_stream, socket_addr)) => {
-                    slog::info!(self.logger, "Incoming control connection from {:?}", socket_addr);
-                    let params: controlchan::LoopConfig<Storage, User> = (&self).into();
-                    let result = controlchan::spawn_loop::<Storage, User>(params, tcp_stream, None, None, self.client_charset).await;
-                    if let Err(err) = result {
-                        slog::error!(
-                            self.logger,
-                            "Could not spawn control channel loop for connection from {:?}: {:?}",
-                            socket_addr,
-                            err
-                        )
-                    }
+        let listen_future = match self.proxy_protocol_mode {
+            ProxyMode::On { external_control_port } => Box::pin(
+                listen_proxied::ProxyProtocolListener {
+                    bind_address,
+                    external_control_port,
+                    logger: self.logger.clone(),
+                    options: (&self).into(),
+                    proxy_protocol_switchboard: Some(ProxyProtocolSwitchboard::new(self.logger.clone(), self.passive_ports.clone())),
+                    client_charset,
+                    shutdown_topic: shutdown_notifier.clone(),
                 }
-                Err(err) => {
-                    slog::error!(self.logger, "Error accepting incoming control connection {:?}", err);
+                .listen(),
+            ) as Pin<Box<dyn Future<Output = std::result::Result<(), ServerError>> + Send>>,
+            ProxyMode::Off => Box::pin(
+                listen::Listener {
+                    bind_address,
+                    logger: self.logger.clone(),
+                    options: (&self).into(),
+                    client_charset,
+                    shutdown_topic: shutdown_notifier.clone(),
                 }
+                .listen(),
+            ) as Pin<Box<dyn Future<Output = std::result::Result<(), ServerError>> + Send>>,
+        };
+
+        tokio::select! {
+            result = listen_future => result,
+            opts = self.shutdown => {
+                slog::debug!(logger, "Shutting down within {:?}", opts.grace_period);
+                shutdown_notifier.notify().await;
+                Self::shutdown_linger(logger, shutdown_notifier, opts.grace_period).await
             }
         }
     }
 
-    #[tracing_attributes::instrument]
-    async fn listen_proxy_protocol_mode<T: Into<String> + Debug>(
-        mut self,
-        bind_address: T,
-        external_control_port: u16,
-    ) -> std::result::Result<(), ServerError> {
-        let addr: std::net::SocketAddr = bind_address.into().parse()?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-
-        // this callback is used by all sessions, basically only to
-        // request for a passive listening port.
-        let (proxyloop_msg_tx, mut proxyloop_msg_rx): (ProxyLoopSender<Storage, User>, ProxyLoopReceiver<Storage, User>) = channel(1);
-
-        loop {
-            // The 'proxy loop' handles two kinds of events:
-            // - incoming tcp connections originating from the proxy
-            // - channel messages originating from PASV, to handle the passive listening port
-
-            tokio::select! {
-
-                Ok((tcp_stream, _socket_addr)) = listener.accept() => {
-                    let socket_addr = tcp_stream.peer_addr();
-                    let mut tcp_stream = tcp_stream;
-
-                    slog::info!(self.logger, "Incoming proxy connection from {:?}", socket_addr);
-                    let connection = match get_peer_from_proxy_header(&mut tcp_stream).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            slog::warn!(self.logger, "proxy protocol decode error: {:?}", e);
-                            continue;
-                        }
-                    };
-
-                    // Based on the proxy protocol header, and the configured control port number,
-                    // we differentiate between connections for the control channel,
-                    // and connections for the data channel.
-                    let destination_port = connection.destination.port();
-                    if destination_port == external_control_port {
-                        let source = connection.source;
-                        slog::info!(self.logger, "Connection from {:?} is a control connection", source);
-                        let params: controlchan::LoopConfig<Storage,User> = (&self).into();
-                        let result = controlchan::spawn_loop::<Storage,User>(params, tcp_stream, Some(source), Some(proxyloop_msg_tx.clone()), self.client_charset).await;
-                        if result.is_err() {
-                            slog::warn!(self.logger, "Could not spawn control channel loop for connection: {:?}", result.err().unwrap())
-                        }
-                    } else {
-                        // handle incoming data connections
-                        slog::info!(self.logger, "Connection from {:?} is a data connection: {:?}, {}", socket_addr, self.passive_ports, destination_port);
-                        if !self.passive_ports.contains(&destination_port) {
-                            slog::warn!(self.logger, "Incoming proxy connection going to unconfigured port! This port is not configured as a passive listening port: port {} not in passive port range {:?}", destination_port, self.passive_ports);
-                            tcp_stream.shutdown().await.unwrap();
-                            continue;
-                        }
-                        self.dispatch_data_connection(tcp_stream, connection).await;
-                    }
-                },
-                Some(msg) = proxyloop_msg_rx.next() => {
-                    match msg {
-                        ProxyLoopMsg::AssignDataPortCommand (session_arc) => {
-                            self.select_and_register_passive_port(session_arc).await;
-                        },
-                    }
-                },
-            };
-        }
-    }
-
-    // this function finds (by hashing <srcip>.<dstport>) the session
-    // that requested this data channel connection in the proxy
-    // protocol switchboard hashmap, and then calls the
-    // spawn_data_processing function with the tcp_stream
-    #[tracing_attributes::instrument]
-    async fn dispatch_data_connection(&mut self, mut tcp_stream: tokio::net::TcpStream, connection: ConnectionTuple) {
-        if let Some(switchboard) = &mut self.proxy_protocol_switchboard {
-            match switchboard.get_session_by_incoming_data_connection(&connection).await {
-                Some(session) => {
-                    spawn_processing(self.logger.clone(), session, tcp_stream).await;
-                    switchboard.unregister(&connection);
-                }
-                None => {
-                    slog::warn!(self.logger, "Unexpected connection ({:?})", connection);
-                    tcp_stream.shutdown().await.unwrap();
-                    return;
-                }
+    // Waits for sub-components to shut down gracefully or aborts if the grace period expires
+    async fn shutdown_linger(logger: slog::Logger, shutdown_notifier: Arc<Notifier>, grace_period: Duration) -> std::result::Result<(), ServerError> {
+        let timeout = Box::pin(tokio::time::sleep(grace_period));
+        tokio::select! {
+            _ = shutdown_notifier.linger() => {
+                slog::debug!(logger, "Graceful shutdown complete");
+                Ok(())
+            },
+            _ = timeout => {
+                Err(ShutdownError{ msg: "shutdown grace period expired".to_string()}.into())
             }
         }
-    }
-
-    #[tracing_attributes::instrument]
-    async fn select_and_register_passive_port(&mut self, session_arc: SharedSession<Storage, User>) {
-        slog::info!(self.logger, "Received internal message to allocate data port");
-        // 1. reserve a port
-        // 2. put the session_arc and tx in the hashmap with srcip+dstport as key
-        // 3. put expiry time in the LIFO list
-        // 4. send reply to client: "Entering Passive Mode ({},{},{},{},{},{})"
-
-        let mut reserved_port: u16 = 0;
-        if let Some(switchboard) = &mut self.proxy_protocol_switchboard {
-            let port = switchboard.reserve_next_free_port(session_arc.clone()).await.unwrap();
-            slog::info!(self.logger, "Reserving data port: {:?}", port);
-            reserved_port = port
-        }
-        let session = session_arc.lock().await;
-        if let Some(destination) = session.destination {
-            let destination_ip = match destination.ip() {
-                IpAddr::V4(ip) => ip,
-                IpAddr::V6(_) => panic!("Won't happen since PASV only does IP V4."),
-            };
-
-            let reply: Reply = super::controlchan::commands::make_pasv_reply(self.passive_host.clone(), &destination_ip, reserved_port).await;
-
-            let tx_some = session.control_msg_tx.clone();
-            if let Some(tx) = tx_some {
-                let mut tx = tx.clone();
-                tx.send(ControlChanMsg::CommandChannelReply(reply)).await.unwrap();
-            }
-        }
-    }
-
-    /// Enables SITE MD5
-    ///
-    /// Warning:
-    /// Depending on the storage backend, SITE MD5 may use relatively much memory and generate high CPU usage.
-    /// This opens a Denial of Service vulnerability that could be exploited by malicious users, by means of flooding the server with SITE MD5 commands.
-    /// As such this feature is probably best user configured and at least disabled for anonymous users by default.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use libunftp::Server;
-    /// use libunftp::options::SiteMd5;
-    /// use unftp_sbe_fs::ServerExt;
-    ///
-    /// // Use it in a builder-like pattern:
-    /// let mut server = Server::with_fs("/tmp").sitemd5(SiteMd5::None);
-    /// ```
-
-    pub fn sitemd5<M: Into<SiteMd5>>(mut self, sitemd5_option: M) -> Self {
-        self.sitemd5 = sitemd5_option.into();
-        self
+        // TODO: Implement feature where we keep on listening for a while i.e. GracefulAcceptingConnections
     }
 }
 
-impl<Storage, User> From<&Server<Storage, User>> for controlchan::LoopConfig<Storage, User>
+impl<Storage, User> From<&Server<Storage, User>> for chosen::OptionsHolder<Storage, User>
 where
     User: UserDetail + 'static,
     Storage: StorageBackend<User> + 'static,
     Storage::Metadata: Metadata,
 {
     fn from(server: &Server<Storage, User>) -> Self {
-        controlchan::LoopConfig {
+        chosen::OptionsHolder {
             authenticator: server.authenticator.clone(),
-            storage: (server.storage)(),
+            storage: server.storage.clone(),
             ftps_config: server.ftps_mode.clone(),
             collect_metrics: server.collect_metrics,
             greeting: server.greeting,
@@ -677,7 +589,35 @@ where
             logger: server.logger.new(slog::o!()),
             ftps_required_control_chan: server.ftps_required_control_chan,
             ftps_required_data_chan: server.ftps_required_data_chan,
-            sitemd5: server.sitemd5,
+            site_md5: server.site_md5,
+            data_listener: server.data_listener.clone(),
+            presence_listener: server.presence_listener.clone(),
         }
+    }
+}
+
+impl<Storage, User> Debug for Server<Storage, User>
+where
+    Storage: StorageBackend<User>,
+    User: UserDetail,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("authenticator", &self.authenticator)
+            .field("collect_metrics", &self.collect_metrics)
+            .field("greeting", &self.greeting)
+            .field("logger", &self.logger)
+            .field("metrics", &self.collect_metrics)
+            .field("passive_ports", &self.passive_ports)
+            .field("passive_host", &self.passive_host)
+            .field("ftps_client_auth", &self.ftps_client_auth)
+            .field("ftps_mode", &self.ftps_mode)
+            .field("ftps_required_control_chan", &self.ftps_required_control_chan)
+            .field("ftps_required_data_chan", &self.ftps_required_data_chan)
+            .field("ftps_tls_flags", &self.ftps_tls_flags)
+            .field("ftps_trust_store", &self.ftps_trust_store)
+            .field("idle_session_timeout", &self.idle_session_timeout)
+            .field("proxy_protocol_mode", &self.proxy_protocol_mode)
+            .finish()
     }
 }

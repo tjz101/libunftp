@@ -3,7 +3,7 @@
 //! Contains the [`Authenticator`](crate::auth::Authenticator) and [`UserDetail`](crate::auth::UserDetail)
 //! traits that are used to extend libunftp's authentication and user detail storage capabilities.
 //!
-//! Pre-made implemenations exists on crates.io (search for `unftp-auth-`) and you can define your
+//! Pre-made implementations exists on crates.io (search for `unftp-auth-`) and you can define your
 //! own implementation to integrate your FTP(S) server with whatever authentication mechanism you
 //! need. For example, to define an `Authenticator` that will randomly decide:
 //!
@@ -16,7 +16,7 @@
 //! 2. Implement the [`Authenticator`] trait and optionally the [`UserDetail`] trait:
 //!
 //! ```no_run
-//! use libunftp::auth::{Authenticator, AuthenticationError, UserDetail};
+//! use libunftp::auth::{Authenticator, AuthenticationError, UserDetail, Credentials};
 //! use async_trait::async_trait;
 //! use unftp_sbe_fs::Filesystem;
 //!
@@ -25,7 +25,7 @@
 //!
 //! #[async_trait]
 //! impl Authenticator<RandomUser> for RandomAuthenticator {
-//!     async fn authenticate(&self, _username: &str, _password: &str) -> Result<RandomUser, AuthenticationError> {
+//!     async fn authenticate(&self, _username: &str, _creds: &Credentials) -> Result<RandomUser, AuthenticationError> {
 //!         Ok(RandomUser{})
 //!     }
 //! }
@@ -62,7 +62,7 @@ pub use anonymous::AnonymousAuthenticator;
 
 pub(crate) mod authenticator;
 #[allow(unused_imports)]
-pub use authenticator::{AuthenticationError, Authenticator};
+pub use authenticator::{AuthenticationError, Authenticator, ClientCert, Credentials};
 
 mod user;
 pub use user::{DefaultUser, UserDetail};

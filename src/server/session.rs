@@ -8,22 +8,25 @@ use crate::{
     metrics,
     storage::{Metadata, StorageBackend},
 };
-use futures::channel::mpsc::{Receiver, Sender};
 use std::{
     fmt::{Debug, Formatter},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
 };
+use tokio::sync::mpsc::{Receiver, Sender};
 
 // TraceId is an identifier used to correlate logs statements together.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub struct TraceId(u64);
 
 impl TraceId {
     pub fn new() -> Self {
+        let mut id = [0; 8];
         // For now keep it simple. Later we may need something more sophisticated
-        TraceId(rand::random())
+        getrandom::getrandom(&mut id).expect("Error generating random TraceId");
+
+        TraceId(u64::from_ne_bytes(id))
     }
 }
 
@@ -43,7 +46,7 @@ pub enum SessionState {
 // The session shared via an asynchronous lock
 pub type SharedSession<S, U> = Arc<tokio::sync::Mutex<Session<S, U>>>;
 
-// This is where we keep the state for a ftp session.
+// This is where we keep the state for an ftp session.
 #[derive(Debug)]
 pub struct Session<Storage, User>
 where
@@ -96,6 +99,8 @@ where
     // Tells if the data loop is running. The control channel need to know if the data channel is
     // busy so that it doesn't time out while the session is still in progress.
     pub data_busy: bool,
+    // The client certificate chain if it was received.
+    pub cert_chain: Option<Vec<crate::auth::ClientCert>>,
 }
 
 impl<Storage, User> Session<Storage, User>
@@ -126,6 +131,7 @@ where
             collect_metrics: false,
             start_pos: 0,
             data_busy: false,
+            cert_chain: None,
         }
     }
 

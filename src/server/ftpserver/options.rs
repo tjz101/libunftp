@@ -1,11 +1,12 @@
 //! Contains code pertaining to the setup options that can be given to the [`Server`](crate::Server)
 
 use bitflags::bitflags;
-use std::fmt::Formatter;
-use std::ops::Range;
+use std::time::Duration;
 use std::{
+    fmt::Formatter,
     fmt::{self, Debug, Display},
     net::{IpAddr, Ipv4Addr},
+    ops::Range,
 };
 
 // Once we're sure about the types of these I think its good to expose it to the API user so that
@@ -18,7 +19,7 @@ pub(crate) const DEFAULT_FTPS_REQUIRE: FtpsRequired = FtpsRequired::None;
 pub(crate) const DEFAULT_FTPS_TRUST_STORE: &str = "./trusted.pem";
 pub(crate) const DEFAULT_CLIENT_CHARSET: &str = "UTF-8";
 
-/// The option to `Server.passive_host`. It allows the user to specify how the IP address
+/// The option to [Server.passive_host](crate::Server::passive_host). It allows the user to specify how the IP address
 /// communicated in the _PASV_ response is determined.
 #[derive(Debug, PartialEq, Clone)]
 pub enum PassiveHost {
@@ -34,6 +35,12 @@ pub enum PassiveHost {
 }
 
 impl Eq for PassiveHost {}
+
+impl Default for PassiveHost {
+    fn default() -> Self {
+        PassiveHost::FromConnection
+    }
+}
 
 impl From<Ipv4Addr> for PassiveHost {
     fn from(ip: Ipv4Addr) -> Self {
@@ -56,7 +63,7 @@ impl From<&str> for PassiveHost {
     }
 }
 
-/// The option to `Server.ftps_required`. It allows the user to specify whether clients are required
+/// The option to [Server.ftps_required](crate::Server::ftps_required). It allows the user to specify whether clients are required
 /// to upgrade a to secure TLS connection i.e. use FTPS.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum FtpsRequired {
@@ -117,7 +124,7 @@ impl Default for TlsFlags {
     }
 }
 
-/// The option to `Server.ftps_client_auth`. Tells if and how mutual TLS (client certificate
+/// The option to [Server.ftps_client_auth](crate::Server::ftps_client_auth). Tells if and how mutual TLS (client certificate
 /// authentication) should be handled.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum FtpsClientAuth {
@@ -151,7 +158,7 @@ impl From<bool> for FtpsClientAuth {
     }
 }
 
-/// The options for `Server.sitemd5`.
+/// The options for [Server.sitemd5](crate::Server::sitemd5).
 /// Allow MD5 either to be used by all, logged in users only or no one.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum SiteMd5 {
@@ -166,5 +173,47 @@ pub enum SiteMd5 {
 impl Default for SiteMd5 {
     fn default() -> SiteMd5 {
         SiteMd5::Accounts
+    }
+}
+
+/// Tells how graceful shutdown should happen. An instance of this struct should be returned from
+/// the future passed to [Server.shutdown_indicator](crate::Server::shutdown_indicator).
+pub struct Shutdown {
+    pub(crate) grace_period: Duration,
+    //pub(crate) handle_new_connections: bool,
+}
+
+impl Shutdown {
+    /// Creates a Shutdown instance with default values
+    pub fn new() -> Self {
+        Shutdown::default()
+    }
+
+    /// Defines how much time to allow for components to shut down before shutdown is forceful.
+    pub fn grace_period(mut self, d: impl Into<Duration>) -> Self {
+        self.grace_period = d.into();
+        self
+    }
+
+    // /// Control channel connections will still be accepted for a while as connections
+    // /// are drained. Clients connecting during this phase will receive an FTP error code.
+    // pub fn handle_new_connections(mut self) -> Self {
+    //     self.handle_new_connections = true;
+    //     self
+    // }
+    //
+    // /// Control channel connections will not be allowed during the shutdown phase.
+    // pub fn block_new_connections(mut self) -> Self {
+    //     self.handle_new_connections = false;
+    //     self
+    // }
+}
+
+impl Default for Shutdown {
+    fn default() -> Shutdown {
+        Shutdown {
+            grace_period: Duration::from_secs(10),
+            //handle_new_connections: false,
+        }
     }
 }

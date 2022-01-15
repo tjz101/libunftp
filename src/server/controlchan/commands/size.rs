@@ -11,8 +11,8 @@ use crate::{
     storage::{Metadata, StorageBackend},
 };
 use async_trait::async_trait;
-use futures::{channel::mpsc::Sender, prelude::*};
 use std::{path::PathBuf, sync::Arc};
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct Size {
@@ -38,12 +38,12 @@ where
         let user = session.user.clone();
         let storage: Arc<Storage> = Arc::clone(&session.storage);
         let path = session.cwd.join(self.path.clone());
-        let mut tx_success: Sender<ControlChanMsg> = args.tx_control_chan.clone();
-        let mut tx_fail: Sender<ControlChanMsg> = args.tx_control_chan.clone();
+        let tx_success: Sender<ControlChanMsg> = args.tx_control_chan.clone();
+        let tx_fail: Sender<ControlChanMsg> = args.tx_control_chan.clone();
         let logger = args.logger;
 
         tokio::spawn(async move {
-            match storage.metadata(&user, &path).await {
+            match storage.metadata((*user).as_ref().unwrap(), &path).await {
                 Ok(metadata) => {
                     let file_len = metadata.len();
                     if let Err(err) = tx_success

@@ -1,6 +1,9 @@
 use crate::{
     auth::{Authenticator, UserDetail},
     metrics::MetricsMiddleware,
+    notification::DataListener,
+    notification::PresenceListener,
+    server::shutdown,
     server::{
         chancomms::{ControlChanMsg, ProxyLoopSender},
         controlchan::{
@@ -13,6 +16,7 @@ use crate::{
             handler::{CommandContext, CommandHandler},
             log::LoggingMiddleware,
             middleware::ControlChanMiddleware,
+            notify::EventDispatcherMiddleware,
             Reply, ReplyCode,
         },
         ftpserver::options::{FtpsRequired, PassiveHost, SiteMd5},
@@ -24,15 +28,16 @@ use crate::{
 };
 
 use async_trait::async_trait;
-use futures::{
-    channel::mpsc::{channel, Receiver, Sender},
-    SinkExt, StreamExt,
-};
+use futures_util::{SinkExt, StreamExt};
+use rustls::ServerConnection;
 use std::{net::SocketAddr, ops::Range, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
-    sync::Mutex,
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Mutex,
+    },
 };
 use tokio_util::codec::{Decoder, Framed};
 
@@ -40,7 +45,7 @@ trait AsyncReadAsyncWriteSendUnpin: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncReadAsyncWriteSendUnpin for T {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config<Storage, User>
 where
     Storage: StorageBackend<User>,
@@ -57,10 +62,12 @@ where
     pub logger: slog::Logger,
     pub ftps_required_control_chan: FtpsRequired,
     pub ftps_required_data_chan: FtpsRequired,
-    pub sitemd5: SiteMd5,
+    pub site_md5: SiteMd5,
+    pub data_listener: Arc<dyn DataListener>,
+    pub presence_listener: Arc<dyn PresenceListener>,
 }
 
-/// Does TCP processing when a FTP client connects
+/// Does TCP processing when an FTP client connects
 #[tracing_attributes::instrument]
 pub async fn spawn<Storage, User>(
     config: Config<Storage, User>,
@@ -68,6 +75,7 @@ pub async fn spawn<Storage, User>(
     destination: Option<SocketAddr>,
     proxyloop_msg_tx: Option<ProxyLoopSender<Storage, User>>,
     client_charset: &'static str,
+    mut shutdown: shutdown::Listener,
 ) -> Result<(), ControlChanError>
 where
     User: UserDetail + 'static,
@@ -85,13 +93,15 @@ where
         collect_metrics,
         idle_session_timeout,
         logger,
-        sitemd5,
+        site_md5: sitemd5,
+        data_listener,
+        presence_listener,
         ..
     } = config;
 
     let tls_configured = matches!(ftps_config, FtpsConfig::On { .. });
     let storage_features = storage.supported_features();
-    let (control_msg_tx, control_msg_rx): (Sender<ControlChanMsg>, Receiver<ControlChanMsg>) = channel(1);
+    let (control_msg_tx, mut control_msg_rx): (Sender<ControlChanMsg>, Receiver<ControlChanMsg>) = channel(1);
     let session: Session<Storage, User> = Session::new(Arc::new(storage), tcp_stream.peer_addr()?)
         .ftps(ftps_config.clone())
         .metrics(collect_metrics)
@@ -106,7 +116,7 @@ where
     let event_chain = PrimaryEventHandler {
         logger: logger.clone(),
         session: shared_session.clone(),
-        authenticator,
+        authenticator: authenticator.clone(),
         tls_configured,
         passive_ports,
         passive_host,
@@ -116,6 +126,8 @@ where
         tx_proxy_loop: proxyloop_msg_tx,
         sitemd5,
     };
+
+    let event_chain = EventDispatcherMiddleware::new(data_listener, presence_listener, event_chain);
 
     let event_chain = AuthMiddleware {
         session: shared_session.clone(),
@@ -147,13 +159,10 @@ where
 
     let codec = FtpCodec::new(client_charset);
     let cmd_and_reply_stream: Framed<Box<dyn AsyncReadAsyncWriteSendUnpin>, FtpCodec> = codec.framed(Box::new(tcp_stream));
-    let (mut reply_sink, command_source) = cmd_and_reply_stream.split();
+    let (mut reply_sink, mut command_source) = cmd_and_reply_stream.split();
 
     reply_sink.send(Reply::new(ReplyCode::ServiceReady, config.greeting)).await?;
     reply_sink.flush().await?;
-
-    let mut command_source = command_source.fuse();
-    let mut control_msg_rx = control_msg_rx.fuse();
 
     tokio::spawn(async move {
         // The control channel event loop
@@ -167,7 +176,7 @@ where
                     Some(cmd_result) = command_source.next() => {
                         incoming = Some(cmd_result.map(Event::Command));
                     },
-                    Some(msg) = control_msg_rx.next() => {
+                    Some(msg) = control_msg_rx.recv() => {
                         incoming = Some(Ok(Event::InternalMsg(msg)));
                     },
                     _ = &mut timeout_delay => {
@@ -176,22 +185,28 @@ where
                             true => incoming = None,
                             false => incoming = Some(Err(ControlChanError::new(ControlChanErrorKind::ControlChannelTimeout)))
                         };
+                    },
+                    _ = shutdown.listen() => {
+                        slog::info!(logger, "Shutting down control loop");
+                        incoming = Some(Ok(Event::InternalMsg(ControlChanMsg::ExitControlLoop)))
+                        // TODO: Do we want to wait a bit for a data transfer to complete i.e. session.data_busy is true?
                     }
                 };
                 incoming
             };
             match incoming {
-                None => {}
+                None => {} // Loop again
+                Some(Ok(Event::InternalMsg(ControlChanMsg::ExitControlLoop))) => {
+                    let _ = event_chain.handle(Event::InternalMsg(ControlChanMsg::ExitControlLoop)).await;
+                    slog::info!(logger, "Exiting control loop");
+                    return;
+                }
                 Some(Ok(event)) => {
-                    if let Event::InternalMsg(ControlChanMsg::Quit) = event {
-                        return;
-                    }
-
                     if let Event::InternalMsg(ControlChanMsg::SecureControlChannel) = event {
                         slog::info!(logger, "Upgrading control channel to TLS");
 
                         // Get back the original TCP Stream
-                        let codec_io = reply_sink.reunite(command_source.into_inner()).unwrap();
+                        let codec_io = reply_sink.reunite(command_source).unwrap();
                         let io = codec_io.into_inner();
 
                         // Wrap in TLS Stream
@@ -201,7 +216,14 @@ where
                         };
                         let accepted = acceptor.accept(io).await;
                         let io: Box<dyn AsyncReadAsyncWriteSendUnpin> = match accepted {
-                            Ok(stream) => Box::new(stream),
+                            Ok(stream) => {
+                                let s: &ServerConnection = stream.get_ref().1;
+                                if let Some(certs) = s.peer_certificates() {
+                                    let mut session = shared_session.lock().await;
+                                    session.cert_chain = Some(certs.iter().map(|c| crate::auth::ClientCert(c.0.clone())).collect());
+                                }
+                                Box::new(stream)
+                            }
                             Err(err) => {
                                 slog::warn!(logger, "Closing control channel. Could not upgrade to TLS: {}", err);
                                 return;
@@ -212,7 +234,6 @@ where
                         let codec = FtpCodec::new(client_charset);
                         let cmd_and_reply_stream = codec.framed(io);
                         let (sink, src) = cmd_and_reply_stream.split();
-                        let src = src.fuse();
                         reply_sink = sink;
                         command_source = src;
                     }
@@ -305,7 +326,7 @@ where
         match msg {
             NotFound => Ok(Reply::new(ReplyCode::FileError, "File not found")),
             PermissionDenied => Ok(Reply::new(ReplyCode::FileError, "Permision denied")),
-            SendData { .. } => {
+            SentData { .. } => {
                 let mut session = self.session.lock().await;
                 session.start_pos = 0;
                 Ok(Reply::new(ReplyCode::ClosingDataConnection, "Successfully sent"))
@@ -321,12 +342,10 @@ where
             UnknownRetrieveError => Ok(Reply::new(ReplyCode::TransientFileError, "Unknown Error")),
             DirectorySuccessfullyListed => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Listed the directory")),
             DirectoryListFailure => Ok(Reply::new(ReplyCode::ClosingDataConnection, "Failed to list the directory")),
-            CwdSuccess => Ok(Reply::new(ReplyCode::FileActionOkay, "Successfully cwd")),
-            DelSuccess => Ok(Reply::new(ReplyCode::FileActionOkay, "File successfully removed")),
+            CwdSuccess => Ok(Reply::new(ReplyCode::FileActionOkay, "Successfully changed working directory")),
+            DelFileSuccess { .. } | RmDirSuccess { .. } => Ok(Reply::new(ReplyCode::FileActionOkay, "Successfully removed")),
             DelFail => Ok(Reply::new(ReplyCode::TransientFileError, "Failed to delete the file")),
-            // The InternalMsg::Quit will never be reached, because we catch it in the task before
-            // this closure is called (because we have to close the connection).
-            Quit => Ok(Reply::new(ReplyCode::ClosingControlConnection, "Bye!")),
+            ExitControlLoop => Ok(Reply::none()),
             SecureControlChannel => {
                 let mut session = self.session.lock().await;
                 session.cmd_tls = true;
@@ -337,14 +356,19 @@ where
                 session.cmd_tls = false;
                 Ok(Reply::none())
             }
-            MkdirSuccess(path) => Ok(Reply::new_with_string(ReplyCode::DirCreated, path.to_string_lossy().to_string())),
+            MkDirSuccess { path } => Ok(Reply::new_with_string(ReplyCode::DirCreated, path)),
             MkdirFail => Ok(Reply::new(ReplyCode::FileError, "Failed to create directory")),
-            AuthSuccess => {
+            RenameSuccess { .. } => Ok(Reply::new(ReplyCode::FileActionOkay, "Renamed")),
+            AuthSuccess { .. } => {
                 let mut session = self.session.lock().await;
                 session.state = WaitCmd;
                 Ok(Reply::new(ReplyCode::UserLoggedIn, "User logged in, proceed"))
             }
-            AuthFailed => Ok(Reply::new(ReplyCode::NotLoggedIn, "Authentication failed")),
+            AuthFailed => {
+                let mut session = self.session.lock().await;
+                session.state = New; // According to RFC 959, a PASS command MUST precede a USER command
+                Ok(Reply::new(ReplyCode::NotLoggedIn, "Authentication failed"))
+            }
             StorageError(error_type) => match error_type.kind() {
                 ErrorKind::ExceededStorageAllocationError => Ok(Reply::new(ReplyCode::ExceededStorageAllocation, "Exceeded storage allocation")),
                 ErrorKind::FileNameNotAllowedError => Ok(Reply::new(ReplyCode::BadFileName, "File name not allowed")),

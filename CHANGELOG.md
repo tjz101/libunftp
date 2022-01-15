@@ -1,10 +1,80 @@
 # Changelog
 
-## Upcoming
+## 2021-09-25 libunftp 0.18.2
 
-_tag: TAG_
+_tag: libunftp-0.18.2_
 
-- Added SITE MD5 support for Filesystem and GCS storage backends. The feature is disabled by default.
+- [#386](https://github.com/bolcom/libunftp/issues/386) Implemented graceful shutdown through the Server.shutdown_indicator method.
+- Upgraded to rustls v0.20.0
+- Upgraded other minor dependency versions
+- Testing improvements
+
+## 2021-09-25 libunftp 0.18.1
+
+_tag: libunftp-0.18.1_
+
+- Replace futures with futures-util and use Tokio's mpsc channels
+- [#371](https://github.com/bolcom/libunftp/pull/371), [#377](https://github.com/bolcom/libunftp/pull/377) Fixed an 
+  issue where rclone reported all file sizes as 0. The fix was to include the number of links to a file in the output 
+  to the client.
+- Fixed a unit tests
+- Upgraded dependencies
+- [#379](https://github.com/bolcom/libunftp/pull/379) Fixed an issue where the `Permissions` struct could not be used 
+  even though it was public.
+- [#380](https://github.com/bolcom/libunftp/pull/380), [#381](https://github.com/bolcom/libunftp/pull/381) Return STAT 
+  response as a multi-line in accordance with RFC 959 in order to fix an issue with the Cyberduck client.
+
+## 2021-07-13 Release of all crates
+
+### libunftp 0.18.0
+
+_tag: libunftp-0.18.0_
+
+- [#356](https://github.com/bolcom/libunftp/pull/356) Authenticators can now also take the connection source IP, and 
+  the client certificate chain into account in addition to the password when performing authentication.
+- [#356](https://github.com/bolcom/libunftp/pull/356/files) **Breaking**: The `Authenticator::authenticate` method now 
+  takes a `Credentials` structure reference instead of a `str` reference for the second parameter.
+- [#373](https://github.com/bolcom/libunftp/pull/373) **Breaking**: The `StorageBackend` methods were all changed to 
+  take a reference of a user (`&User`) instead of an optional reference to it (`&Option<User>`).
+- Dependency upgrades and cleanups
+- Fixed an issue where OPTS UTF8 returned the wrong FTP reply code
+- [#361](https://github.com/bolcom/libunftp/issues/361) Don't allow consecutive PASS commands
+- Added support for TLS client certificates
+- [#358](https://github.com/bolcom/libunftp/pull/358/files) Added the ability for authenticators to do password-less 
+  authentication when the user presents a valid client certificate. See the `Authenticator.cert_auth_sufficient` method. 
+  
+### unftp-auth-jsonfile v0.2.0
+
+_tag: unftp-auth-jsonfile-0.2.0_
+
+- Added support for per-user IP allow lists
+- [#369](https://github.com/bolcom/libunftp/issues/369) Added support for per-user client certificate CN matching
+- [#355](https://github.com/bolcom/libunftp/pull/355) Created a new Docker image that generates PBKDF2 keys for the
+  authenticator.
+
+### unftp-auth-* v0.2.0
+
+- compiled unftp-auth-pam against libunftp v0.18.0
+- compiled unftp-auth-rest against libunftp v0.18.0
+
+### unftp-sbe-* v0.2.0
+
+- compiled unftp-sbe-fs against libunftp v0.18.0
+- compiled unftp-sbe-gcs against libunftp v0.18.0
+
+## 2021-05-22 unftp-sbe-gcs v0.1.1
+
+_tag: unftp-sbe-gcs-0.1.1_
+
+- Added an extension trait that adds a `Server::with_gcs` constructor.
+- Added support for the `SITE MD5` FTP command. Also see [Server::sitemd5](https://docs.rs/libunftp/0.17.4/libunftp/struct.Server.html#method.sitemd5) in libunftp. 
+
+## 2021-05-22 libunftp 0.17.4
+
+_tag: libunftp-0.17.4_
+
+- Added a new `SITE MD5` command that allows FTP clients to obtain the MD5 checksum of a remote file. The feature is 
+  disabled for anonymous users by default. See [Server::sitemd5](https://docs.rs/libunftp/0.17.4/libunftp/struct.Server.html#method.sitemd5).
 
 ## 2021-05-02 libunftp v0.17.3
 

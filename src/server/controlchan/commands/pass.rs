@@ -25,8 +25,8 @@ use crate::{
     storage::{Metadata, StorageBackend},
 };
 use async_trait::async_trait;
-use futures::{channel::mpsc::Sender, prelude::*};
 use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct Pass {
@@ -52,30 +52,38 @@ where
         let logger = args.logger;
         match &session.state {
             SessionState::WaitPass => {
-                let pass: &str = std::str::from_utf8(&self.password.as_ref())?;
+                let pass: &str = std::str::from_utf8(self.password.as_ref())?;
                 let pass: String = pass.to_string();
-                let user: String = match session.username.clone() {
+                let username: String = match session.username.clone() {
                     Some(v) => v,
                     None => {
                         slog::error!(logger, "NoneError for username. This shouldn't happen.");
                         return Ok(Reply::new(ReplyCode::NotLoggedIn, "Please open a new connection to re-authenticate"));
                     }
                 };
-                let mut tx: Sender<ControlChanMsg> = args.tx_control_chan.clone();
+                let tx: Sender<ControlChanMsg> = args.tx_control_chan.clone();
 
                 let auther = args.authenticator.clone();
 
                 // without this, the REST authenticator hangs when
                 // performing a http call through Hyper
                 let session2clone = args.session.clone();
+                let creds = crate::auth::Credentials {
+                    password: Some(pass),
+                    source_ip: session.source.ip(),
+                    certificate_chain: session.cert_chain.clone(),
+                };
                 tokio::spawn(async move {
-                    let msg = match auther.authenticate(&user, &pass).await {
+                    let msg = match auther.authenticate(&username, &creds).await {
                         Ok(user) => {
                             if user.account_enabled() {
                                 let mut session = session2clone.lock().await;
                                 slog::info!(logger, "User {} logged in", user);
                                 session.user = Arc::new(Some(user));
-                                ControlChanMsg::AuthSuccess
+                                ControlChanMsg::AuthSuccess {
+                                    username,
+                                    trace_id: session.trace_id,
+                                }
                             } else {
                                 slog::warn!(logger, "User {} authenticated but account is disabled", user);
                                 ControlChanMsg::AuthFailed

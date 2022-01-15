@@ -122,7 +122,7 @@ where
             let path = line
                 .split(|&b| b == b' ')
                 .filter(|s| !line.is_empty() && !s.starts_with(b"-"))
-                .map(|s| String::from_utf8_lossy(&s).to_string())
+                .map(|s| String::from_utf8_lossy(s).to_string())
                 .next();
             // Note that currently we just throw arguments away.
             Command::List { options: None, path }
@@ -333,7 +333,7 @@ where
             Command::Mdtm { file }
         }
         "SITE" => {
-            let (cmd_token, cmd_params) = split_token_params(&cmd_params);
+            let (cmd_token, cmd_params) = split_token_params(cmd_params);
             let cmd_token = normalize(cmd_token)?;
 
             match &*cmd_token {

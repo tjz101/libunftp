@@ -25,7 +25,7 @@ use crate::{
     storage::{Metadata, StorageBackend},
 };
 use async_trait::async_trait;
-use futures::{channel::mpsc::Sender, prelude::*};
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct Quit;
@@ -39,10 +39,10 @@ where
 {
     #[tracing_attributes::instrument]
     async fn handle(&self, args: CommandContext<Storage, User>) -> Result<Reply, ControlChanError> {
-        let mut tx: Sender<ControlChanMsg> = args.tx_control_chan.clone();
+        let tx: Sender<ControlChanMsg> = args.tx_control_chan.clone();
         let logger = args.logger;
         // Let the control loop know it can exit.
-        if let Err(send_res) = tx.send(ControlChanMsg::Quit).await {
+        if let Err(send_res) = tx.send(ControlChanMsg::ExitControlLoop).await {
             slog::warn!(logger, "could not send internal message: QUIT. {}", send_res);
         }
         Ok(Reply::new(ReplyCode::ClosingControlConnection, "Bye!"))

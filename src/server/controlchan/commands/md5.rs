@@ -12,8 +12,8 @@ use crate::{
     storage::{StorageBackend, FEATURE_SITEMD5},
 };
 use async_trait::async_trait;
-use futures::{channel::mpsc::Sender, prelude::*};
 use std::{path::PathBuf, sync::Arc};
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub struct Md5 {
@@ -38,22 +38,23 @@ where
         let user = session.user.clone();
         let storage = Arc::clone(&session.storage);
         let path = session.cwd.join(self.path.clone());
-        let mut tx_success: Sender<ControlChanMsg> = args.tx_control_chan.clone();
-        let mut tx_fail: Sender<ControlChanMsg> = args.tx_control_chan.clone();
+        let tx_success: Sender<ControlChanMsg> = args.tx_control_chan.clone();
+        let tx_fail: Sender<ControlChanMsg> = args.tx_control_chan.clone();
         let logger = args.logger;
 
         match args.sitemd5 {
             SiteMd5::All => {}
-            SiteMd5::Accounts => {
-                if let Some(u) = &session.username {
+            SiteMd5::Accounts => match &session.username {
+                Some(u) => {
                     if u == "anonymous" || u == "ftp" {
                         return Ok(Reply::new(ReplyCode::CommandNotImplemented, "Command is not available."));
-                    } else {
-                        slog::error!(logger, "NoneError for username. This shouldn't happen.");
-                        return Ok(Reply::new(ReplyCode::NotLoggedIn, "Please open a new connection to re-authenticate"));
                     }
                 }
-            }
+                None => {
+                    slog::error!(logger, "NoneError for username. This shouldn't happen.");
+                    return Ok(Reply::new(ReplyCode::NotLoggedIn, "Please open a new connection to re-authenticate"));
+                }
+            },
             SiteMd5::None => {
                 return Ok(Reply::new(ReplyCode::CommandNotImplemented, "Command is not available."));
             }
@@ -63,12 +64,12 @@ where
         }
 
         tokio::spawn(async move {
-            match storage.md5(&user, &path).await {
+            match storage.md5((*user).as_ref().unwrap(), &path).await {
                 Ok(md5) => {
                     if let Err(err) = tx_success
                         .send(ControlChanMsg::CommandChannelReply(Reply::new_with_string(
                             ReplyCode::FileStatus,
-                            format!("{}    {}", md5, path.as_path().display().to_string()),
+                            format!("{}    {}", md5, path.as_path().display()),
                         )))
                         .await
                     {
